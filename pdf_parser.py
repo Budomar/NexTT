@@ -1,0 +1,1928 @@
+# pdf_parser.py
+import pandas as pd
+import traceback
+from typing import Optional, List, Dict, Any, Callable
+import re
+import os
+import glob
+from datetime import datetime
+import json
+
+
+class PDFParser:
+    """
+    УНИВЕРСАЛЬНЫЙ ВСЕЯДНЫЙ ПАРСЕР PDF С МАКСИМАЛЬНОЙ ОТЛАДКОЙ И ОПТИМИЗАЦИЕЙ
+    Автоматизирует чтение, парсинг и переподбор данных из PDF в Excel
+    Теперь с пропуском нерелевантных страниц для ускорения обработки
+    """
+    def __init__(self, progress_callback: Optional[Callable[[int, int], None]] = None):
+        """
+        Инициализация парсера
+        :param progress_callback: Функция обратного вызова для отслеживания прогресса: callback(current_page, total_pages)
+        """
+        self.supported_types = {"VK-PROF", "K-PROF"}
+        self.debug_mode = True  # ВКЛЮЧАЕМ ОТЛАДКУ ПО УМОЛЧАНИЮ
+        self.analysis_results = {}
+        self.progress_callback = progress_callback
+        
+        # Ключевые слова для быстрой проверки страниц (радиаторы и смежная тематика)
+        self.radiator_keywords = [
+            # Основные термины
+            'радиатор', 'радиаторный', 'радиаторная', 'радиаторное', 'радиаторные',
+            'стальной', 'панельный', 'панельная', 'панельное', 'панельные',
+            'отопление', 'отопительный', 'отопительная', 'отопительное', 
+            'конвектор', 'конвекторный',
+            
+            # Типы и серии
+            'тип 11', 'тип 22', 'тип 33', 'тип 21', 'тип 23', 'тип 10', 'тип 20',
+            'h33', 'h22', 'h21', 'c21', 'c22', 'h33-', 'h22-', 'h21-', 'c11',
+            'compact', 'ventil', 'гигиенический', 'hygiene', 'универсал',
+            
+            # Бренды
+            'royal', 'thermo', 'royal thermo', 'buderus', 'kermi', 'purmo', 'purmo',
+            'evra', 'hiterm', 'cv', 'ftv', 'fto', 'ftk',
+            
+            # Подключение
+            'нижним подключением', 'боковым подключением',
+            'нижнее подключение', 'боковое подключение', 'нижний подключение',
+            'универсальное подключение',
+            
+            # Размеры
+            'высотой', 'длиной', 'l=', 'высота', 'длина', 'ширина', 'глубина',
+            '500x800', '300x1000', '400x1200', '600x900',
+            
+            # Английские термины
+            'radiator', 'panel', 'heater', 'steel', 'radiators', 'convector',
+            'panel radiator', 'steel panel',
+            
+            # Для спецификаций
+            'спецификация', 'ведомость', 'оборудование', 'материалы',
+            'позиция', 'наименование', 'марка', 'тип',
+            
+            # Единицы измерения
+            'шт', 'шт.', 'ед', 'ед.', 'pcs', 'pc', 'qty', 'quantity',
+            'кол-во', 'количество', 'единиц',
+            
+            # Мощность
+            'вт', 'ватт', 'watt', 'qn', 'qp', 'мощность', 'теплоотдача',
+            
+            # Регистры
+            'рг-', 'регистр', 'регистровый',
+        ]
+    
+    def get_pdf_page_count(self, file_path: str) -> int:
+        """
+        Получить количество страниц в PDF файле
+        :param file_path: Путь к PDF файлу
+        :return: Количество страниц
+        """
+        try:
+            import pdfplumber
+            with pdfplumber.open(file_path) as pdf:
+                return len(pdf.pages)
+        except Exception as e:
+            self._log(f"❌ Ошибка при получении количества страниц: {e}", "ERROR")
+            raise RuntimeError(f"Не удалось определить количество страниц в PDF: {e}")
+    def _log(self, message: str, level: str = "INFO"):
+        """Логирование только в консоль"""
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        log_message = f"[{timestamp}][{level}] {message}"
+        print(log_message)
+
+    def _log_table_info(self, table: List, table_name: str):
+        """Логирование информации о таблице"""
+        if not table:
+            self._log(f"📭 Таблица {table_name}: ПУСТАЯ", "DEBUG")
+            return
+        rows_count = len(table)
+        cols_count = max(len(row) for row in table) if table else 0
+        non_empty_cells = sum(1 for row in table for cell in row if cell and str(cell).strip())
+        self._log(f"📊 Таблица {table_name}: {rows_count} строк, {cols_count} колонок, {non_empty_cells} непустых ячеек", "DEBUG")
+        for i, row in enumerate(table[:2]):
+            row_preview = [str(cell)[:50] + "..." if cell and len(str(cell)) > 50 else str(cell) for cell in row[:5]]
+            self._log(f"   Строка {i}: {row_preview}", "DEBUG")
+
+    # ============ НОВЫЙ МЕТОД: БЫСТРАЯ ПРОВЕРКА СТРАНИЦЫ ============
+    def _should_process_page(self, page, page_num: int) -> bool:
+        """
+        Быстрая проверка, стоит ли обрабатывать страницу
+        Возвращает True если на странице есть признаки таблиц с радиаторами
+        """
+        try:
+            # 1. Извлекаем текст страницы
+            text = page.extract_text()
+            
+            # 2. Если текст очень короткий (< 50 символов) - вероятно, это чертеж/схема
+            if not text or len(text.strip()) < 50:
+                self._log(f"📄 Страница {page_num}: ПРОПУСК (мало текста, вероятно чертеж)", "SKIP")
+                return False
+            
+            text_lower = text.lower()
+            
+            # 3. Проверяем наличие ключевых слов (РАСШИРЕННЫЙ СПИСОК)
+            found_keywords = []
+            for keyword in self.radiator_keywords:
+                if keyword in text_lower:
+                    found_keywords.append(keyword)
+            
+            # 4. Проверяем специфические паттерны радиаторов (РАСШИРЕННЫЕ)
+            radiator_patterns = [
+                r'\b[HСCКK]\d{1,2}[-\s]*\d{3,4}[-\s]*\d{3,4}\b',  # H33-200-1000, C21-300-600
+                r'\bPURMO\s+[CHK]\s*\d{1,2}',  # PURMO C 21, PURMO H 20
+                r'\bтип\s*\d+\s*[Ll]\s*[=:]\s*\d+\s*мм',
+                r'\bвысотой\s*\d+\s*мм',
+                r'\bдлин[аой]\s*\d+\s*мм',
+                r'\b\d{3,4}\s*[xх×]\s*\d{3,4}\s*Вт\b',  # 500x800 Вт
+                r'\b[Qq][нp]\s*[=:]\s*\d+\s*Вт\b',  # Qн=2356 Вт
+                r'\b(?:радиатор|конвектор)\s*[^.]{0,50}\d+\s*шт\b',  # радиатор ... 2 шт
+            ]
+            
+            found_patterns = []
+            for pattern in radiator_patterns:
+                if re.search(pattern, text_lower, re.IGNORECASE):
+                    found_patterns.append(pattern)
+            
+            # 5. Ищем столбец "Количество" или "Кол-во" (разные варианты)
+            has_quantity_column = re.search(
+                r'коли[ -]?чество|кол[ -]?во|ед\.|шт\.|pcs|pc|qty|единиц|штук',
+                text_lower
+            )
+            
+            # 6. Ищем спецификации/ведомости
+            has_spec_header = re.search(
+                r'спецификация|ведомость|оборудован[иея]|материал[ыов]|позиция|наименование',
+                text_lower
+            )
+            
+            # 7. Логируем что нашли
+            if found_keywords:
+                self._log(f"📄 Страница {page_num}: найдены ключевые слова: {found_keywords[:3]}...", "CHECK")
+            if found_patterns:
+                self._log(f"📄 Страница {page_num}: найдены паттерны радиаторов", "CHECK")
+            if has_quantity_column:
+                self._log(f"📄 Страница {page_num}: есть столбец количества", "CHECK")
+            if has_spec_header:
+                self._log(f"📄 Страница {page_num}: есть заголовок спецификации", "CHECK")
+            
+            # 8. Критерии для обработки страницы (БОЛЕЕ ГИБКИЕ):
+            # - Есть ключевые слова ИЛИ паттерны
+            # - И (столбец количества ИЛИ заголовок спецификации)
+            should_process = (
+                (len(found_keywords) >= 1 or len(found_patterns) >= 1) and 
+                (has_quantity_column or has_spec_header)
+            )
+            
+            # Дополнительный критерий: если есть четкие модели PURMO, обрабатываем
+            if not should_process and re.search(r'PURMO\s+[CHK]\s*\d{1,2}', text_lower):
+                self._log(f"📄 Страница {page_num}: найдены модели PURMO, обрабатываем", "CHECK")
+                should_process = True
+            
+            if not should_process:
+                self._log(f"📄 Страница {page_num}: ПРОПУСК (нет признаков таблиц с радиаторами)", "SKIP")
+                # Быстрый анализ первых строк текста для отладки
+                lines = text.split('\n')[:5]
+                preview = ' | '.join([line[:50] for line in lines if line.strip()])
+                if preview:
+                    self._log(f"   📝 Предпросмотр: {preview[:100]}...", "DEBUG")
+            
+            return should_process
+            
+        except Exception as e:
+            self._log(f"⚠️ Ошибка при проверке страницы {page_num}: {e}", "DEBUG")
+            # В случае ошибки лучше обработать страницу (безопасный режим)
+            return True
+
+    # ============ ДОПОЛНЕНИЯ ДЛЯ РАДИАТОРОВ ============
+    def _normalize_text(self, text: str) -> str:
+        """
+        Универсальный препроцессинг текста для борьбы с OCR и шумом:
+        - Удаляет дублирование букв (aa → a)
+        - Заменяет латиницу на кириллицу
+        - Нормализует x/×/х → x
+        - Убирает артикулы и мусор
+        """
+        if not text or not isinstance(text, str):
+            return ""
+        
+        # 1. Удаляем повторяющиеся буквы (OCR-артефакты)
+        text = re.sub(r'([а-яА-Яa-zA-Z])\1+', r'\1', text)
+        
+        # 2. Нормализуем латиницу в кириллицу (расширенный список)
+        latin_to_cyrillic = {
+            'o': 'о', 'O': 'О',
+            'p': 'р', 'P': 'Р',
+            'a': 'а', 'A': 'А',
+            'e': 'е', 'E': 'Е',
+            'x': 'х', 'X': 'Х',
+            'c': 'с', 'C': 'С',
+            'y': 'у', 'Y': 'У',
+            'k': 'к', 'K': 'К',
+            'm': 'м', 'M': 'М',
+            't': 'т', 'T': 'Т',
+            'b': 'в', 'B': 'В',
+            'H': 'Н', 'N': 'Н',
+            'f': 'ф', 'F': 'Ф',
+            'i': 'и', 'I': 'И',
+            'g': 'г', 'G': 'Г',
+            'l': 'л', 'L': 'Л',
+            'z': 'з', 'Z': 'З',
+            'u': 'у', 'j': 'й', 'q': 'я', 'Q': 'Я',
+            'd': 'д', 'D': 'Д',
+            'r': 'р', 'R': 'Р',
+            's': 'с', 'S': 'С',
+            'v': 'в', 'V': 'В',
+            'w': 'ш', 'W': 'Ш',
+            'h': 'н', 'H': 'Н',
+            'n': 'п', 'N': 'П',
+        }
+        
+        for en, ru in latin_to_cyrillic.items():
+            text = text.replace(en, ru)
+        
+        # 3. Нормализуем различные символы "x" к единому виду
+        text = re.sub(r'[x×х]', 'x', text)
+        
+        # 4. Заменяем запятые в числах на точки (1,5 → 1.5)
+        text = re.sub(r'(\d),(\d)', r'\1.\2', text)
+        
+        # 5. Убираем артикулы и мусор
+        text = re.sub(r'(?:арт|артикул|code|код)\s*[.:]?\s*\S*\d+\S*', '', text, flags=re.IGNORECASE)
+        
+        # 6. Нормализуем пробелы и дефисы
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'[-\s]+', '-', text)
+        
+        # 7. Убираем лишние символы в начале/конце
+        text = text.strip('.,;:!?()[]{}"\'')
+        
+        return text.strip()
+
+    def extract_radiator_name(self, text: str) -> Optional[str]:
+        """Извлекает название радиатора с учётом различных форматов"""
+        if not text or not isinstance(text, str):
+            return None
+        
+        clean_text = self._normalize_text(text)
+        
+        # РАСШИРЕННЫЕ ПАТТЕРНЫ ДЛЯ ВСЕЯДНОСТИ
+        patterns = [
+            # 1. PURMO формат: PURMO C 21s 500x800
+            r'\bPURMO\s+([CHK])\s*(\d{1,2})s?\s*(\d{2,4})\s*[xх×-]\s*(\d{2,4})\b',
+            
+            # 2. Компактный формат: C21-500-800, H20-400-1200
+            r'\b([CHK])\s*(\d{1,2})[-\s]*(\d{2,4})[-\s]*(\d{2,4})\b',
+            
+            # 3. С буквой "s": C21s 500x800
+            r'\b([CHK])\s*(\d{1,2})s\s*(\d{2,4})\s*[xх×]\s*(\d{2,4})\b',
+            
+            # 4. Без пробелов: C21500800
+            r'\b([CHK])\s*(\d{1,2})\s*(\d{2,4})\s*(\d{2,4})\b',
+            
+            # 5. С разделителями: C21/500/800
+            r'\b([CHK])\s*(\d{1,2})[/\\]\s*(\d{2,4})[/\\]\s*(\d{2,4})\b',
+            
+            # 6. Регистры: РГ-113-84-1,5
+            r'\bРГ[-\s]*(\d{1,3})[-\s]*(\d{1,3})[-\s]*(\d+[.,]?\d*)\b',
+            
+            # 7. Другие бренды: KERMI FTV 22 600x1000
+            r'\b(KERMI|BUDERUS|ROYAL|THERMO)\s+([A-Z]+)?\s*(\d{1,2})\s*(\d{2,4})\s*[xх×]\s*(\d{2,4})\b',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, clean_text, re.IGNORECASE)
+            if match:
+                groups = match.groups()
+                
+                # Для PURMO формата
+                if 'PURMO' in pattern and len(groups) >= 4:
+                    return f"PURMO {groups[0]}{groups[1]} {groups[2]}x{groups[3]}"
+                
+                # Для компактного формата (C21-500-800)
+                elif len(groups) == 4 and groups[0] in ['C', 'H', 'K']:
+                    return f"{groups[0]}{groups[1]}-{groups[2]}-{groups[3]}"
+                
+                # Для регистров
+                elif 'РГ' in pattern and len(groups) >= 3:
+                    return f"РГ-{groups[0]}-{groups[1]}-{groups[2]}"
+                
+                # Для других брендов
+                elif len(groups) >= 5:
+                    brand = groups[0]
+                    model = f"{groups[2]}" if groups[1] else ""
+                    return f"{brand} {model} {groups[3]}x{groups[4]}".strip()
+        
+        return None
+
+    def extract_quantity_from_row(self, row: pd.Series) -> int:
+        """Извлекает количество из всей строки DataFrame (более всеядно)"""
+        quantity = 0
+        
+        for cell in row:
+            if pd.notna(cell):
+                str_cell = str(cell).strip()
+                
+                # Убираем лишние пробелы и нормализуем
+                str_cell = re.sub(r'\s+', ' ', str_cell)
+                
+                # 1. Прямое число (123)
+                if re.match(r'^\d+$', str_cell):
+                    return int(str_cell)
+                
+                # 2. Число с единицами измерения (2 шт, 4ед., 10 шт.)
+                qty_patterns = [
+                    r'^(\d+)\s*шт\.?$',          # "2 шт", "4шт."
+                    r'^(\d+)\s*ед\.?$',          # "2 ед", "4ед."
+                    r'^(\d+)\s*pcs?\.?$',        # "2 pcs", "4pc"
+                    r'^qty\s*[=:\s]*(\d+)',      # "qty=2", "qty: 4"
+                    r'^кол-?во\s*[=:\s]*(\d+)',  # "кол-во=2", "количество: 4"
+                    r'^(\d+)\s*$',               # Просто число с пробелами вокруг
+                ]
+                
+                for pattern in qty_patterns:
+                    match = re.search(pattern, str_cell, re.IGNORECASE)
+                    if match:
+                        try:
+                            return int(match.group(1))
+                        except:
+                            continue
+                
+                # 3. Ищем число в составе строки (если нет других вариантов)
+                # Но только если строка короткая и явно содержит количество
+                if len(str_cell) < 30:
+                    numbers = re.findall(r'\b(\d+)\b', str_cell)
+                    if numbers:
+                        # Предпочитаем последнее число (часто количество в конце)
+                        return int(numbers[-1])
+        
+        return quantity
+
+    def extract_radiators_from_dataframe(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+        """Преобразует DataFrame в список радиаторов"""
+        results = []
+        for idx, row in df.iterrows():
+            full_row_text = ' '.join(str(cell) for cell in row if pd.notna(cell) and str(cell).strip())
+            if not full_row_text.strip():
+                continue
+
+            context_ok = any(kw in full_row_text.lower() for kw in [
+                'радиатор', 'панельный', 'buderus', 'royal', 'thermo', 'evra', 'k-prof', 'vk-prof', 'cv', 'hiterm',
+                'pupmo', 'стальной', 'отопление', 'тип 11', 'тип 22', 'тип 33',
+                'compact', 'ventil', 'нижним подключением', 'боковым подключением'
+            ])
+            if not context_ok:
+                continue
+
+            radiator_name = self.extract_radiator_name(full_row_text)
+            if not radiator_name:
+                continue
+
+            quantity = self.extract_quantity_from_row(row)
+            if quantity == 0:
+                continue
+
+            source_page = row.get('_source_page', 'unknown')
+            results.append({
+                'name': radiator_name,
+                'quantity': quantity,
+                'source_page': source_page,
+                'original_row': full_row_text[:200]
+            })
+
+        # Объединяем дубли по (name, source_page)
+        unique_results = {}
+        for item in results:
+            key = (item['name'], item['source_page'])
+            if key in unique_results:
+                unique_results[key]['quantity'] += item['quantity']
+            else:
+                unique_results[key] = item
+
+        return list(unique_results.values())
+
+    # ============ ОСНОВНОЙ МЕТОД ПАРСИНГА (ОПТИМИЗИРОВАННЫЙ) С ПОДДЕРЖКОЙ ВЫБОРА СТРАНИЦ ============
+    def parse_to_dataframe(self, file_path: str, 
+                        start_page: int = 1, 
+                        end_page: Optional[int] = None,
+                        max_pages: Optional[int] = None,
+                        pages: Optional[List[int]] = None) -> pd.DataFrame:
+        """
+        ГЛАВНЫЙ МЕТОД - парсит ЛЮБОЙ PDF в DataFrame с оптимизацией скорости
+        Пропускает страницы без признаков таблиц с радиаторами
+        Поддерживает выбор конкретных страниц через параметр pages
+        
+        :param file_path: Путь к PDF файлу
+        :param start_page: Номер первой страницы для обработки (начиная с 1) - используется если pages=None
+        :param end_page: Номер последней страницы для обработки (None = до конца) - используется если pages=None
+        :param max_pages: Максимальное количество страниц для обработки - используется если pages=None
+        :param pages: Список конкретных страниц для обработки (номера с 1). Если задан, игнорирует start_page/end_page/max_pages
+        :return: DataFrame с результатами парсинга
+        """
+        try:
+            import pdfplumber
+        except ImportError:
+            raise RuntimeError("❌ БИБЛИОТЕКА PDFPLUMBER НЕ УСТАНОВЛЕНА! Выполните: pip install pdfplumber")
+        
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"❌ ФАЙЛ НЕ НАЙДЕН: {file_path}")
+        
+        self._log("🚀" * 50)
+        self._log(f"🚀 ЗАПУСК ОПТИМИЗИРОВАННОГО ПАРСИНГА PDF: {os.path.basename(file_path)}")
+        
+        # Определяем режим работы
+        if pages is not None:
+            self._log(f"📄 РЕЖИМ: обработка выбранных страниц")
+            self._log(f"📄 Выбранные страницы: {sorted(pages)}")
+        else:
+            self._log(f"📄 РЕЖИМ: обработка диапазона страниц")
+            if start_page != 1:
+                self._log(f"📄 НАЧАЛЬНАЯ СТРАНИЦА: {start_page}")
+            if end_page:
+                self._log(f"📄 КОНЕЧНАЯ СТРАНИЦА: {end_page}")
+            if max_pages:
+                self._log(f"⚡ ОГРАНИЧЕНИЕ: не более {max_pages} страниц")
+        
+        self._log(f"📁 Полный путь: {file_path}")
+        self._log(f"📏 Размер файла: {os.path.getsize(file_path) / 1024 / 1024:.2f} MB")
+        self._log("🚀" * 50)
+        
+        try:
+            all_tables = []
+            total_pages_processed = 0
+            total_pages_skipped = 0
+            
+            with pdfplumber.open(file_path) as pdf:
+                total_pages_in_pdf = len(pdf.pages)
+                self._log(f"📄 ОБНАРУЖЕНО СТРАНИЦ В PDF: {total_pages_in_pdf}")
+                
+                # Подготавливаем список страниц для обработки
+                pages_to_process = []
+                
+                if pages is not None:
+                    # Режим: обработка конкретных выбранных страниц
+                    # Проверяем корректность номеров страниц
+                    valid_pages = []
+                    for page_num in pages:
+                        if 1 <= page_num <= total_pages_in_pdf:
+                            valid_pages.append(page_num)
+                        else:
+                            self._log(f"⚠️  Страница {page_num} пропущена (вне диапазона 1-{total_pages_in_pdf})", "WARNING")
+                    
+                    if not valid_pages:
+                        raise ValueError(f"Нет корректных страниц для обработки. Диапазон страниц: 1-{total_pages_in_pdf}")
+                    
+                    pages_to_process = sorted(set(valid_pages))  # Убираем дубликаты и сортируем
+                    self._log(f"📄 Будет обработано страниц: {len(pages_to_process)} из {len(pages)} запрошенных")
+                    
+                    # Обновляем для отображения в логировании
+                    start_page = min(pages_to_process)
+                    end_page = max(pages_to_process)
+                    
+                else:
+                    # Режим: обработка диапазона страниц (старая логика)
+                    if start_page < 1:
+                        start_page = 1
+                        self._log(f"⚠️  start_page исправлен на 1 (минимальное значение)")
+                    
+                    if end_page is None:
+                        end_page = total_pages_in_pdf
+                        self._log(f"📄 Конечная страница не указана, берём до конца: {end_page}")
+                    elif end_page > total_pages_in_pdf:
+                        end_page = total_pages_in_pdf
+                        self._log(f"⚠️  end_page исправлен на {total_pages_in_pdf} (максимум в файле)")
+                    
+                    # Проверяем валидность диапазона
+                    if start_page > end_page:
+                        self._log(f"❌ ОШИБКА: start_page ({start_page}) > end_page ({end_page})")
+                        raise ValueError(f"Некорректный диапазон страниц: {start_page}-{end_page}")
+                    
+                    # Применяем ограничение max_pages
+                    pages_in_range = end_page - start_page + 1
+                    if max_pages and max_pages > 0 and pages_in_range > max_pages:
+                        original_end = end_page
+                        end_page = start_page + max_pages - 1
+                        if end_page > total_pages_in_pdf:
+                            end_page = total_pages_in_pdf
+                        self._log(f"⚡ ОГРАНИЧЕНИЕ max_pages: сокращаем диапазон с {start_page}-{original_end} до {start_page}-{end_page}")
+                    
+                    # Создаем список всех страниц в диапазоне
+                    pages_to_process = list(range(start_page, end_page + 1))
+                
+                self._log(f"📄 ФИНАЛЬНЫЙ СПИСОК СТРАНИЦ ДЛЯ ОБРАБОТКИ: {pages_to_process[:10]}{'...' if len(pages_to_process) > 10 else ''}")
+                self._log(f"📄 ВСЕГО ДЛЯ ОБРАБОТКИ: {len(pages_to_process)} стр.")
+                
+                # Быстрый анализ структуры только первых страниц
+                analysis_pages = min(3, len(pages_to_process))
+                for i in range(analysis_pages):
+                    page_idx = pages_to_process[i] - 1
+                    if page_idx < len(pdf.pages):
+                        page = pdf.pages[page_idx]
+                        text_preview = page.extract_text()[:100] if page.extract_text() else "Нет текста"
+                        self._log(f"🔍 Превью стр. {pages_to_process[i]}: {text_preview}...")
+                
+                # Обрабатываем только выбранные страницы
+                for idx, page_num in enumerate(pages_to_process):
+                    page_idx = page_num - 1
+                    page = pdf.pages[page_idx]
+                    
+                    # 🔥 ВЫЗЫВАЕМ ОБРАТНЫЙ ВЫЗОВ ПРОГРЕССА (если задан)
+                    if self.progress_callback:
+                        # Прогресс относительно общего количества обрабатываемых страниц
+                        current_in_range = idx + 1
+                        total_in_range = len(pages_to_process)
+                        self.progress_callback(current_in_range, total_in_range)
+                    
+                    # 🔥 БЫСТРАЯ ПРОВЕРКА: СТОИТ ЛИ ОБРАБАТЫВАТЬ ЭТУ СТРАНИЦУ?
+                    if not self._should_process_page(page, page_num):
+                        total_pages_skipped += 1
+                        continue
+                    
+                    self._log(f"\n📖 {'='*60}")
+                    self._log(f"📖 ОБРАБОТКА СТРАНИЦЫ {page_num} (в PDF: стр. {page_num}/{total_pages_in_pdf})")
+                    self._log(f"📖 Прогресс: {idx + 1}/{len(pages_to_process)}")
+                    self._log(f"📖 {'='*60}")
+                    
+                    page_tables = self._extract_tables_universal(page, page_num)
+                    if page_tables:
+                        all_tables.extend(page_tables)
+                        total_pages_processed += 1
+                    
+                    # Анализ текста только если есть таблицы
+                    if page_tables:
+                        self._extract_and_analyze_text(page, page_num)
+            
+            # Сводка по обработке
+            self._log(f"\n📊 {'='*60}")
+            self._log(f"📊 СВОДКА ПО ПАРСИНГУ:")
+            self._log(f"📊 Всего страниц в PDF: {total_pages_in_pdf}")
+            
+            if pages is not None:
+                self._log(f"📊 Запрошенные страницы: {len(pages)} шт.")
+                self._log(f"📊 Валидные страницы: {len(pages_to_process)} шт.")
+            else:
+                self._log(f"📊 Запрошенный диапазон: {start_page}-{end_page}")
+            
+            self._log(f"📊 Обработано страниц: {total_pages_processed}")
+            self._log(f"📊 Пропущено страниц: {total_pages_skipped}")
+            self._log(f"📊 Найдено таблиц: {len(all_tables)}")
+            
+            if pages_to_process and (min(pages_to_process) > 1 or max(pages_to_process) < total_pages_in_pdf):
+                self._log(f"📊 Парсинг выполнен не полностью: обработано {len(pages_to_process)} из {total_pages_in_pdf} страниц")
+            
+            if max_pages and len(pages_to_process) >= max_pages:
+                self._log(f"📊 Достигнуто ограничение max_pages: {max_pages}")
+                
+            self._log(f"📊 Экономия времени: {(total_pages_skipped/len(pages_to_process))*100:.1f}% страниц пропущено")
+            self._log(f"📊 {'='*60}")
+            
+            if all_tables:
+                # Выбираем только лучшие таблицы (без дублирования страниц)
+                best_tables = []
+                pages_processed = set()
+                for table in all_tables:
+                    page = table['_source_page'].iloc[0] if '_source_page' in table.columns else 0
+                    if page not in pages_processed:
+                        best_tables.append(table)
+                        pages_processed.add(page)
+                
+                self._log(f"📊 Выбрано {len(best_tables)} лучших таблиц из {len(all_tables)}")
+                result_df = self._merge_all_tables(best_tables)
+            else:
+                result_df = pd.DataFrame()
+            
+            result_df = self._replace_na_values(result_df)
+            self._analyze_final_result(result_df, file_path)
+            
+            if not result_df.empty:
+                self._log(f"✅ УСПЕХ! СОЗДАН DATAFRAME: {result_df.shape}")
+                # Извлекаем радиаторы из результата
+                radiators = self.extract_radiators_from_dataframe(result_df)
+                self._log(f"✅ Извлечено {len(radiators)} позиций радиаторов")
+                # Показываем примеры найденных радиаторов
+                if radiators:
+                    self._log("📋 Примеры найденных радиаторов:")
+                    for i, rad in enumerate(radiators[:5]):
+                        self._log(f"   {i+1}. {rad['name']} - {rad['quantity']} шт. (стр. {rad['source_page']})")
+            else:
+                self._log("⚠️ ВНИМАНИЕ: В PDF НЕ НАЙДЕНО ТАБЛИЧНЫХ ДАННЫХ")
+            
+            return result_df
+            
+        except Exception as e:
+            error_msg = f"❌ КРИТИЧЕСКАЯ ОШИБКА ПАРСИНГА {file_path}:\n{str(e)}\n{traceback.format_exc()}"
+            self._log(error_msg, "ERROR")
+            raise RuntimeError(error_msg)
+
+    # ============ ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ============
+    def parse_to_dataframe_with_pages(self, file_path: str, pages: List[int]) -> pd.DataFrame:
+        """
+        Упрощенный метод для парсинга только указанных страниц
+        :param file_path: Путь к PDF файлу
+        :param pages: Список страниц для обработки (номера с 1)
+        :return: DataFrame с результатами парсинга
+        """
+        return self.parse_to_dataframe(file_path, pages=pages)
+    
+    def _analyze_pdf_structure_quick(self, pdf, max_pages: int = 3):
+        """Быстрый анализ структуры PDF (только первые страницы)"""
+        self._log(f"\n🔍 БЫСТРЫЙ АНАЛИЗ СТРУКТУРЫ PDF (первые {max_pages} страниц):")
+        try:
+            metadata = pdf.metadata
+            if metadata:
+                self._log(f"📋 Тип PDF: {metadata.get('Producer', 'Неизвестно')}")
+            
+            for i in range(min(max_pages, len(pdf.pages))):
+                page = pdf.pages[i]
+                text = page.extract_text()[:200] if page.extract_text() else "Нет текста"
+                self._log(f"📄 Страница {i+1}: {page.width:.1f}x{page.height:.1f}, текст: {text[:100]}...")
+                
+        except Exception as e:
+            self._log(f"⚠️ Ошибка быстрого анализа PDF: {e}", "DEBUG")
+
+    # ============ СТАНДАРТНЫЕ МЕТОДЫ (БЕЗ ИЗМЕНЕНИЙ) ============
+    def _analyze_pdf_structure(self, pdf):
+        self._log("\n🔍 АНАЛИЗ СТРУКТУРЫ PDF:")
+        try:
+            metadata = pdf.metadata
+            if metadata:
+                self._log(f"📋 Метаданные PDF: {json.dumps(metadata, indent=2, default=str)}")
+            for i in range(min(3, len(pdf.pages))):
+                page = pdf.pages[i]
+                self._log(f"📄 Страница {i+1}: {page.width:.1f}x{page.height:.1f}, слов: {len(page.extract_words())}")
+        except Exception as e:
+            self._log(f"⚠️ Ошибка анализа структуры PDF: {e}", "DEBUG")
+
+    def _extract_tables_universal(self, page, page_num: int) -> List[pd.DataFrame]:
+        tables_df = []
+        strategies = [
+            {"name": "СТРАТЕГИЯ ПО УМОЛЧАНИЮ", "params": {}},
+            {"name": "ЛИНИИ+ЛИНИИ", "params": {"vertical_strategy": "lines", "horizontal_strategy": "lines"}},
+            {"name": "ТЕКСТ+ТЕКСТ", "params": {"vertical_strategy": "text", "horizontal_strategy": "text"}},
+            {"name": "ЛИНИИ+ТЕКСТ", "params": {"vertical_strategy": "lines", "horizontal_strategy": "text"}},
+            {"name": "ТЕКСТ+ЛИНИИ", "params": {"vertical_strategy": "text", "horizontal_strategy": "lines"}},
+            {"name": "СНИППЕТЫ", "params": {"snap_tolerance": 5, "join_tolerance": 5}},
+        ]
+        for strategy in strategies:
+            strategy_name = strategy["name"]
+            strategy_params = strategy["params"]
+            self._log(f"\n🎯 ИСПОЛЬЗУЮ СТРАТЕГИЮ: {strategy_name}")
+            self._log(f"⚙️  Параметры: {strategy_params}")
+            try:
+                tables = page.extract_tables(strategy_params)
+                if tables:
+                    self._log(f"✅ Найдено таблиц: {len(tables)}")
+                    for table_idx, table in enumerate(tables):
+                        table_name = f"Страница_{page_num}_{strategy_name}_Таблица_{table_idx+1}"
+                        self._log_table_info(table, table_name)
+                        if table and self._is_valid_table(table):
+                            df = self._table_to_dataframe(table, page_num, strategy_name, table_idx)
+                            if not df.empty:
+                                # === ФИЛЬТРАЦИЯ МУСОРНЫХ ТАБЛИЦ ===
+                                if df.shape[0] < 2 or df.shape[1] < 2:
+                                    self._log(f"❌ Пропущена таблица: слишком мелкая ({df.shape})", "DEBUG")
+                                    continue
+                                text_flat = ' '.join(df.astype(str).values.flatten())
+                                radiator_keywords = (
+                                    r'радиатор|стальной|панельный|отопительн|'
+                                    r'radiator|heater|panel\s+heater|convector|'
+                                    r'шт|шт\.|ед|ед\.|pcs|pc|pieces|qty|quantity|q-?ty|кол-?во|количество|'
+                                    r'U\d{2}-\d{3,4}-\d{3,4}|C\d{2}-\d{3,4}-\d{3,4}|'
+                                    r'[VK]\d{2}|VK-\d{2}|K-\d{2}|type\s*\d+|тип\s*\d+|'
+                                    r'compact|classic|ventil|prado|purmo|kermi|royal|ftv|fto|ftk|'
+                                    r'нижн(?:ее|ий)\s+подключ|боков\w+\s+подключ|universal'
+                                )
+                                if not re.search(radiator_keywords, text_flat, re.IGNORECASE):
+                                    self._log(f"❌ Пропущена таблица: нет признаков радиаторов", "DEBUG")
+                                    continue
+                                # === КОНЕЦ ФИЛЬТРАЦИИ ===
+                                tables_df.append(df)
+                                self._log(f"✅ Таблица добавлена в результаты", "SUCCESS")
+                            else:
+                                self._log(f"⚠️ Таблица отфильтрована (пустая после очистки)", "WARNING")
+                        else:
+                            self._log(f"❌ Таблица невалидна", "DEBUG")
+                else:
+                    self._log(f"❌ Таблиц не найдено", "DEBUG")
+            except Exception as e:
+                self._log(f"❌ Ошибка стратегии {strategy_name}: {e}", "ERROR")
+                continue
+        self._log(f"📊 ИТОГО со страницы {page_num}: {len(tables_df)} валидных таблиц")
+        return tables_df    
+    
+    def _extract_tables_universal(self, page, page_num: int) -> List[pd.DataFrame]:
+        tables_df = []
+        strategies = [
+            {"name": "СТРАТЕГИЯ ПО УМОЛЧАНИЮ", "params": {}},
+            {"name": "ЛИНИИ+ЛИНИИ", "params": {"vertical_strategy": "lines", "horizontal_strategy": "lines"}},
+            {"name": "ТЕКСТ+ТЕКСТ", "params": {"vertical_strategy": "text", "horizontal_strategy": "text"}},
+            {"name": "ЛИНИИ+ТЕКСТ", "params": {"vertical_strategy": "lines", "horizontal_strategy": "text"}},
+            {"name": "ТЕКСТ+ЛИНИИ", "params": {"vertical_strategy": "text", "horizontal_strategy": "lines"}},
+            {"name": "СНИППЕТЫ", "params": {"snap_tolerance": 5, "join_tolerance": 5}},
+        ]
+        for strategy in strategies:
+            strategy_name = strategy["name"]
+            strategy_params = strategy["params"]
+            self._log(f"\n🎯 ИСПОЛЬЗУЮ СТРАТЕГИЮ: {strategy_name}")
+            self._log(f"⚙️  Параметры: {strategy_params}")
+            try:
+                tables = page.extract_tables(strategy_params)
+                if tables:
+                    self._log(f"✅ Найдено таблиц: {len(tables)}")
+                    for table_idx, table in enumerate(tables):
+                        table_name = f"Страница_{page_num}_{strategy_name}_Таблица_{table_idx+1}"
+                        self._log_table_info(table, table_name)
+                        if table and self._is_valid_table(table):
+                            df = self._table_to_dataframe(table, page_num, strategy_name, table_idx)
+                            if not df.empty:
+                                # === ФИЛЬТРАЦИЯ МУСОРНЫХ ТАБЛИЦ ===
+                                if df.shape[0] < 2 or df.shape[1] < 2:
+                                    self._log(f"❌ Пропущена таблица: слишком мелкая ({df.shape})", "DEBUG")
+                                    continue
+                                
+                                # РАСШИРЕННЫЙ ПОИСК ПРИЗНАКОВ РАДИАТОРОВ
+                                text_flat = ' '.join(df.astype(str).values.flatten())
+                                
+                                # Расширенные ключевые слова для всеядности
+                                radiator_patterns = (
+                                    r'радиатор|стальной|панельный|отопительн|'  # Основные термины
+                                    r'radiator|heater|panel\s+heater|convector|'  # Английские термины
+                                    
+                                    # Ключевые слова для количества (разные варианты написания)
+                                    r'шт|шт\.|ед|ед\.|pcs|pc|pieces|qty|quantity|q-?ty|кол-?во|количество|'
+                                    
+                                    # Паттерны моделей радиаторов (PURMO, Kermi, Buderus и т.д.)
+                                    r'PURMO\s+[CHK]\s*\d{1,2}|'
+                                    r'KERMI\s+[A-Z]\d{1,2}|'
+                                    r'BUDERUS\s+[A-Z]\d{1,2}|'
+                                    r'ROYAL\s+THERMO|'
+                                    r'K-PROF|VK-PROF|CV\d{1,2}|HITERM|EVRA|'
+                                    
+                                    # Паттерны размеров (300x800, 500×1000 и т.д.)
+                                    r'\d{3,4}\s*[xх×]\s*\d{3,4}|'
+                                    
+                                    # Паттерны подключения
+                                    r'нижн(?:ее|ий)\s+подключ|боков\w+\s+подключ|нижнее|боковое|'
+                                    
+                                    # Типы и серии
+                                    r'тип\s*\d+|type\s*\d+|серия|seria|'
+                                    r'compact|classic|ventil|prado|purmo|kermi|royal|ftv|fto|ftk|'
+                                    r'universal|гигиенический|hygiene|'
+                                    
+                                    # Мощность/тепло (Ватты)
+                                    r'Вт|ватт|watt|Qн|Qp|'
+                                    
+                                    # Специфические модели из вашего PDF
+                                    r'C\s*\d{1,2}s|H\s*\d{1,2}|'
+                                    r'РГ-\d{1,3}-\d{1,3}-\d{1,2}'
+                                )
+                                
+                                # МЯГКАЯ ПРОВЕРКА: считаем баллы за найденные признаки
+                                score = 0
+                                found_patterns = []
+                                
+                                # Проверяем основные паттерны
+                                import re
+                                if re.search(r'радиатор|стальной|панельный|отопительн', text_flat, re.IGNORECASE):
+                                    score += 3
+                                    found_patterns.append('радиатор')
+                                
+                                if re.search(r'PURMO|KERMI|BUDERUS|ROYAL', text_flat, re.IGNORECASE):
+                                    score += 2
+                                    found_patterns.append('бренд')
+                                
+                                if re.search(r'\d{3,4}\s*[xх×]\s*\d{3,4}', text_flat, re.IGNORECASE):
+                                    score += 2
+                                    found_patterns.append('размеры')
+                                
+                                if re.search(r'шт|шт\.|ед|ед\.|кол-во|количество', text_flat, re.IGNORECASE):
+                                    score += 2
+                                    found_patterns.append('количество')
+                                
+                                if re.search(r'Вт|ватт|Qн|Qp', text_flat, re.IGNORECASE):
+                                    score += 1
+                                    found_patterns.append('мощность')
+                                
+                                if re.search(r'C\s*\d{1,2}s|H\s*\d{1,2}', text_flat, re.IGNORECASE):
+                                    score += 3  # Высокий балл за специфические модели PURMO
+                                    found_patterns.append('модель_PURMO')
+                                
+                                # Логируем что нашли
+                                if found_patterns:
+                                    self._log(f"🔍 Найдены признаки радиаторов: {set(found_patterns)} (баллы: {score})", "DEBUG")
+                                
+                                # Принимаем таблицу если есть хотя бы признаки радиаторов ИЛИ модели PURMO
+                                should_keep_table = (score >= 3)  # Минимум 3 балла
+                                
+                                if not should_keep_table:
+                                    self._log(f"❌ Пропущена таблица: недостаточно признаков радиаторов (баллы: {score})", "DEBUG")
+                                    continue
+                                
+                                self._log(f"✅ Таблица принята (баллы: {score})", "SUCCESS")
+                                # === КОНЕЦ ФИЛЬТРАЦИИ ===
+                                
+                                tables_df.append(df)
+                                self._log(f"✅ Таблица добавлена в результаты", "SUCCESS")
+                            else:
+                                self._log(f"⚠️ Таблица отфильтрована (пустая после очистки)", "WARNING")
+                        else:
+                            self._log(f"❌ Таблица невалидна", "DEBUG")
+                else:
+                    self._log(f"❌ Таблиц не найдено", "DEBUG")
+            except Exception as e:
+                self._log(f"❌ Ошибка стратегии {strategy_name}: {e}", "ERROR")
+                continue
+        self._log(f"📊 ИТОГО со страницы {page_num}: {len(tables_df)} валидных таблиц")
+        return tables_df
+
+    def _is_valid_table(self, table: List) -> bool:
+        if not table or len(table) == 0:
+            return False
+        total_cells = sum(len(row) for row in table)
+        non_empty_cells = sum(1 for row in table for cell in row if cell and str(cell).strip())
+        fill_ratio = non_empty_cells / total_cells if total_cells > 0 else 0
+        is_valid = (non_empty_cells >= 2 and fill_ratio > 0.1 and len(table) >= 1)
+        self._log(f"🔍 Анализ таблицы: {len(table)} строк, {total_cells} ячеек, {non_empty_cells} заполненных ({fill_ratio:.1%})", "DEBUG")
+        self._log(f"🔍 Таблица валидна: {is_valid}", "DEBUG")
+        return is_valid
+
+    def _table_to_dataframe(self, table: List, page_num: int, strategy_name: str, table_idx: int) -> pd.DataFrame:
+        try:
+            self._log(f"🔄 Конвертация таблицы в DataFrame...", "DEBUG")
+            df = pd.DataFrame(table)
+            original_shape = df.shape
+            self._log(f"📊 Исходный DataFrame: {original_shape}", "DEBUG")
+            df = self._clean_table_dataframe(df)
+            if df.empty:
+                self._log(f"❌ DataFrame пуст после очистки", "DEBUG")
+                return pd.DataFrame()
+            df['_source_page'] = page_num
+            df['_source_strategy'] = strategy_name
+            df['_source_table_index'] = table_idx
+            df['_row_index_original'] = range(len(df))
+            self._log(f"✅ Успешная конвертация: {original_shape} -> {df.shape}", "SUCCESS")
+            return df
+        except Exception as e:
+            self._log(f"❌ Ошибка конвертации таблицы: {e}", "ERROR")
+            return pd.DataFrame()
+
+    # ============ НОВЫЙ МЕТОД: ПАРСИНГ С ВЫБОРОМ СТРАНИЦ ============
+    def parse_to_dataframe_with_range(self, file_path: str, 
+                                      start_page: int = 1, 
+                                      end_page: Optional[int] = None,
+                                      max_pages: Optional[int] = None) -> pd.DataFrame:
+        """
+        Парсит PDF в DataFrame с возможностью выбора диапазона страниц
+        
+        :param file_path: Путь к PDF файлу
+        :param start_page: Номер первой страницы для обработки (начиная с 1)
+        :param end_page: Номер последней страницы для обработки (None = до конца)
+        :param max_pages: Максимальное количество страниц для обработки
+        :return: DataFrame с результатами парсинга
+        """
+        try:
+            import pdfplumber
+        except ImportError:
+            raise RuntimeError("❌ БИБЛИОТЕКА PDFPLUMBER НЕ УСТАНОВЛЕНА! Выполните: pip install pdfplumber")
+        
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"❌ ФАЙЛ НЕ НАЙДЕН: {file_path}")
+        
+        self._log("🚀" * 50)
+        self._log(f"🚀 ЗАПУСК ПАРСИНГА С ВЫБОРОМ СТРАНИЦ: {os.path.basename(file_path)}")
+        self._log(f"📁 Полный путь: {file_path}")
+        
+        try:
+            all_tables = []
+            total_pages_processed = 0
+            total_pages_skipped = 0
+            
+            with pdfplumber.open(file_path) as pdf:
+                total_pages = len(pdf.pages)
+                self._log(f"📄 ОБНАРУЖЕНО СТРАНИЦ В PDF: {total_pages}")
+                
+                # Корректируем диапазон страниц
+                if start_page < 1:
+                    start_page = 1
+                    self._log(f"⚠️  start_page исправлен на 1 (минимальное значение)")
+                
+                if end_page is None:
+                    end_page = total_pages
+                elif end_page > total_pages:
+                    end_page = total_pages
+                    self._log(f"⚠️  end_page исправлен на {total_pages} (максимум в файле)")
+                
+                self._log(f"📄 ДИАПАЗОН ОБРАБОТКИ: страницы с {start_page} по {end_page}")
+                
+                # Применяем ограничение max_pages
+                pages_in_range = end_page - start_page + 1
+                if max_pages and max_pages > 0 and pages_in_range > max_pages:
+                    end_page = start_page + max_pages - 1
+                    self._log(f"⚡ ОГРАНИЧЕНИЕ max_pages: обработаем страницы с {start_page} по {end_page}")
+                
+                for page_num in range(start_page, end_page + 1):
+                    page = pdf.pages[page_num - 1]
+                    
+                    # 🔥 ВЫЗЫВАЕМ ОБРАТНЫЙ ВЫЗОВ ПРОГРЕССА (если задан)
+                    if self.progress_callback:
+                        self.progress_callback(page_num - start_page + 1, end_page - start_page + 1)
+                    
+                    # 🔥 БЫСТРАЯ ПРОВЕРКА: СТОИТ ЛИ ОБРАБАТЫВАТЬ ЭТУ СТРАНИЦУ?
+                    if not self._should_process_page(page, page_num):
+                        total_pages_skipped += 1
+                        continue
+                    
+                    self._log(f"\n📖 {'='*60}")
+                    self._log(f"📖 ОБРАБОТКА СТРАНИЦЫ {page_num}/{end_page} (всего в PDF: {total_pages})")
+                    self._log(f"📖 {'='*60}")
+                    
+                    page_tables = self._extract_tables_universal(page, page_num)
+                    if page_tables:
+                        all_tables.extend(page_tables)
+                        total_pages_processed += 1
+                    
+                    # Анализ текста только если есть таблицы
+                    if page_tables:
+                        self._extract_and_analyze_text(page, page_num)
+            
+            # Сводка по обработке
+            self._log(f"\n📊 {'='*60}")
+            self._log(f"📊 СВОДКА ПО ПАРСИНГУ С ВЫБОРОМ СТРАНИЦ:")
+            self._log(f"📊 Всего страниц в PDF: {total_pages}")
+            self._log(f"📊 Запрошенный диапазон: {start_page}-{end_page}")
+            self._log(f"📊 Обработано страниц: {total_pages_processed}")
+            self._log(f"📊 Пропущено страниц: {total_pages_skipped}")
+            self._log(f"📊 Найдено таблиц: {len(all_tables)}")
+            self._log(f"📊 {'='*60}")
+            
+            if all_tables:
+                # Выбираем только лучшие таблицы (без дублирования страниц)
+                best_tables = []
+                pages_processed = set()
+                for table in all_tables:
+                    page = table['_source_page'].iloc[0] if '_source_page' in table.columns else 0
+                    if page not in pages_processed:
+                        best_tables.append(table)
+                        pages_processed.add(page)
+                
+                self._log(f"📊 Выбрано {len(best_tables)} лучших таблиц из {len(all_tables)}")
+                result_df = self._merge_all_tables(best_tables)
+            else:
+                result_df = pd.DataFrame()
+            
+            result_df = self._replace_na_values(result_df)
+            self._analyze_final_result(result_df, file_path)
+            
+            if not result_df.empty:
+                self._log(f"✅ УСПЕХ! СОЗДАН DATAFRAME: {result_df.shape}")
+                # Извлекаем радиаторы из результата
+                radiators = self.extract_radiators_from_dataframe(result_df)
+                self._log(f"✅ Извлечено {len(radiators)} позиций радиаторов")
+                # Показываем примеры найденных радиаторов
+                if radiators:
+                    self._log("📋 Примеры найденных радиаторов:")
+                    for i, rad in enumerate(radiators[:5]):
+                        self._log(f"   {i+1}. {rad['name']} - {rad['quantity']} шт. (стр. {rad['source_page']})")
+            else:
+                self._log("⚠️ ВНИМАНИЕ: В PDF НЕ НАЙДЕНО ТАБЛИЧНЫХ ДАННЫХ")
+            
+            return result_df
+            
+        except Exception as e:
+            error_msg = f"❌ КРИТИЧЕСКАЯ ОШИБКА ПАРСИНГА {file_path}:\n{str(e)}\n{traceback.format_exc()}"
+            self._log(error_msg, "ERROR")
+            raise RuntimeError(error_msg)
+
+    def _clean_table_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        original_shape = df.shape
+        self._log(f"🧹 Начало очистки DataFrame: {original_shape}", "DEBUG")
+        df = df.astype(str)
+        df = df.apply(lambda x: x.str.strip())
+        df = df.replace({
+            '': '', 'nan': '', 'None': '', '<NA>': '', 'NaT': '',
+            'NULL': '', 'null': '', 'NaN': '', 'N/A': '', 'n/a': ''
+        })
+        mask_rows = df.astype(str).apply(lambda x: x.str.strip() != '').any(axis=1)
+        df = df[mask_rows]
+        mask_cols = df.astype(str).apply(lambda x: x.str.strip() != '').any(axis=0)
+        df = df.loc[:, mask_cols]
+        if not df.empty:
+            df = df.reset_index(drop=True)
+            new_columns = [f"Col_{i}" for i in range(len(df.columns))]
+            df.columns = new_columns
+        self._log(f"✅ Очистка завершена: {original_shape} -> {df.shape}", "SUCCESS")
+        return df
+
+    def _extract_and_analyze_text(self, page, page_num: int):
+        try:
+            text = page.extract_text()
+            if text:
+                lines = text.split('\n')
+                self._log(f"📝 Текст страницы {page_num}: {len(lines)} строк")
+                keywords = ['радиатор', 'радиаторный', 'K-PROF', 'VK-PROF', 'Buderus', 'тепло', 'отопление']
+                found_keywords = []
+                for line in lines[:10]:
+                    for keyword in keywords:
+                        if keyword.lower() in line.lower():
+                            found_keywords.append(keyword)
+                if found_keywords:
+                    self._log(f"🔑 Найдены ключевые слова: {list(set(found_keywords))}", "SUCCESS")
+                for i, line in enumerate(lines[:3]):
+                    if line.strip():
+                        self._log(f"   📄 Строка {i+1}: {line[:100]}...", "DEBUG")
+        except Exception as e:
+            self._log(f"⚠️ Ошибка анализа текста: {e}", "DEBUG")
+
+    def _merge_all_tables(self, all_tables: List[pd.DataFrame]) -> pd.DataFrame:
+        if not all_tables:
+            return pd.DataFrame()
+        if len(all_tables) == 1:
+            return all_tables[0]
+        self._log(f"\n🔗 ОБЪЕДИНЕНИЕ {len(all_tables)} ТАБЛИЦ...")
+        try:
+            result = pd.concat(all_tables, ignore_index=True, sort=False)
+            self._log(f"✅ Простое объединение успешно: {result.shape}", "SUCCESS")
+            result = self._final_cleanup(result)
+            return result
+        except Exception as e:
+            self._log(f"❌ Ошибка объединения: {e}", "ERROR")
+            try:
+                result = all_tables[0]
+                for i, table in enumerate(all_tables[1:], 1):
+                    try:
+                        result = pd.concat([result, table], ignore_index=True)
+                        self._log(f"✅ Успешно объединена таблица {i+1}", "DEBUG")
+                    except Exception as e2:
+                        self._log(f"❌ Ошибка объединения таблицы {i+1}: {e2}", "DEBUG")
+                        continue
+                return result
+            except:
+                return all_tables[0] if all_tables else pd.DataFrame()
+
+    def _final_cleanup(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        original_shape = df.shape
+        mask = df.astype(str).apply(lambda x: x.str.strip() != '').any(axis=1)
+        df = df[mask]
+        mask_cols = df.astype(str).apply(lambda x: x.str.strip() != '').any(axis=0)
+        df = df.loc[:, mask_cols]
+        df = df.reset_index(drop=True)
+        self._log(f"✅ Финальная очистка завершена: {original_shape} -> {df.shape}", "SUCCESS")
+        return df
+
+    def _replace_na_values(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        self._log(f"\n🛡️  ЗАЩИТА ОТ PD.NA В DATAFRAME: {df.shape}")
+        df = df.fillna('')
+        na_patterns = ['nan', 'None', 'NoneType', '<NA>', 'NaT', 'NULL', 'null', 'NaN', 'N/A', 'n/a']
+        for pattern in na_patterns:
+            count = (df == pattern).sum().sum()
+            if count > 0:
+                self._log(f"   🔄 Заменяю '{pattern}': {count} значений")
+        df = df.replace(na_patterns, '')
+        for col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+        self._log(f"✅ Защита от pd.NA применена успешно", "SUCCESS")
+        return df
+
+    def _analyze_final_result(self, df: pd.DataFrame, file_path: str):
+        self._log(f"\n📊 {'='*60}")
+        self._log(f"📊 ДЕТАЛЬНЫЙ АНАЛИЗ ФИНАЛЬНОГО РЕЗУЛЬТАТА")
+        self._log(f"📊 {'='*60}")
+        if df.empty:
+            self._log("❌ DataFrame пуст - анализ невозможен")
+            return
+        self._log(f"📏 РАЗМЕР: {df.shape}")
+        self._log(f"🔢 Строк: {len(df)}, Колонок: {len(df.columns)}")
+        for col in df.columns:
+            non_empty = (df[col].str.strip() != '').sum()
+            unique_count = df[col].nunique()
+            sample_values = df[col].head(3).tolist()
+            self._log(f"   {col}: {non_empty}/{len(df)} заполнено, {unique_count} уникальных")
+            self._log(f"     Примеры: {sample_values}")
+        radiator_keywords = ['K-PROF', 'VK-PROF', 'радиатор', 'Buderus', 'радиаторный']
+        for keyword in radiator_keywords:
+            count = df.astype(str).apply(lambda x: x.str.contains(keyword, case=False, na=False)).sum().sum()
+            if count > 0:
+                self._log(f"   ✅ '{keyword}': найдено {count} упоминаний", "SUCCESS")
+            else:
+                self._log(f"   ❌ '{keyword}': не найдено", "DEBUG")
+        if '_source_page' in df.columns:
+            pages_used = df['_source_page'].nunique()
+            self._log(f"📄 ИСПОЛЬЗОВАНО СТРАНИЦ: {pages_used}")
+        self.analysis_results[file_path] = {
+            'shape': df.shape,
+            'columns': list(df.columns),
+            'total_rows': len(df),
+            'non_empty_rows': (df.astype(str).apply(lambda x: x.str.strip() != '')).any(axis=1).sum(),
+            'timestamp': datetime.now().isoformat()
+        }
+
+    def auto_detect_column_mapping(self, df: pd.DataFrame) -> Dict[str, str]:
+        self._log(f"\n🔍 АВТОМАТИЧЕСКОЕ ОПРЕДЕЛЕНИЕ КОЛОНОК:")
+        mapping = {}
+        column_patterns = {
+            'наименование': ['наименование', 'name', 'описание', 'description', 'характеристика'],
+            'тип': ['тип', 'марка', 'type', 'model'],
+            'код': ['код', 'артикул', 'code', 'article'],
+            'количество': ['количество', 'кол-во', 'count', 'quantity'],
+            'единица': ['единица', 'ед', 'unit'],
+            'масса': ['масса', 'weight', 'вес']
+        }
+        for col in df.columns:
+            col_lower = str(col).lower()
+            self._log(f"   Анализ колонки '{col}': {col_lower}")
+            for field_name, patterns in column_patterns.items():
+                if any(pattern in col_lower for pattern in patterns):
+                    mapping[col] = field_name
+                    self._log(f"     ✅ Сопоставлено с '{field_name}'", "SUCCESS")
+                    break
+            else:
+                self._log(f"     ❌ Не распознана", "DEBUG")
+        self._log(f"📋 ИТОГО сопоставлено: {len(mapping)} колонок")
+        return mapping
+
+    def batch_process_directory(self, directory_path: str = "."):
+        self._log(f"\n📂 ПАКЕТНАЯ ОБРАБОТКА ДИРЕКТОРИИ: {directory_path}")
+        if not os.path.exists(directory_path):
+            self._log(f"❌ Директория не существует: {directory_path}", "ERROR")
+            return
+        pdf_files = glob.glob(os.path.join(directory_path, "*.pdf"))
+        self._log(f"📄 Найдено PDF файлов: {len(pdf_files)}")
+        if not pdf_files:
+            self._log("❌ PDF файлы не найдены", "ERROR")
+            return
+        results = {}
+        for pdf_file in pdf_files:
+            try:
+                self._log(f"\n{'='*80}")
+                self._log(f"🔄 ОБРАБОТКА ФАЙЛА: {os.path.basename(pdf_file)}")
+                self._log(f"{'='*80}")
+                df = self.parse_to_dataframe(pdf_file)
+                if not df.empty:
+                    results[pdf_file] = {
+                        'status': 'success',
+                        'shape': df.shape
+                    }
+                else:
+                    results[pdf_file] = {
+                        'status': 'empty',
+                        'shape': (0, 0)
+                    }
+            except Exception as e:
+                self._log(f"❌ Ошибка обработки файла {pdf_file}: {e}", "ERROR")
+                results[pdf_file] = {
+                    'status': 'error',
+                    'error': str(e)
+                }
+        success_count = sum(1 for r in results.values() if r['status'] == 'success')
+        empty_count = sum(1 for r in results.values() if r['status'] == 'empty')
+        error_count = sum(1 for r in results.values() if r['status'] == 'error')
+        self._log(f"\n📊 СВОДНЫЙ ОТЧЕТ ПО ПАКЕТНОЙ ОБРАБОТКЕ:")
+        self._log(f"✅ Успешно: {success_count} файлов")
+        self._log(f"⚠️  Пустые: {empty_count} файлов") 
+        self._log(f"❌ Ошибки: {error_count} файлов")
+        return results
+
+    def parse_optimized(self, file_path: str, 
+                    start_page: int = 1, 
+                    end_page: Optional[int] = None,
+                    max_pages: Optional[int] = None,
+                    pages: Optional[List[int]] = None) -> pd.DataFrame:
+        """
+        Оптимизированный парсинг с поддержкой выбора страниц
+        :param file_path: Путь к PDF файлу
+        :param start_page: Номер первой страницы для обработки (начиная с 1)
+        :param end_page: Номер последней страницы для обработки (None = до конца)
+        :param max_pages: Максимальное количество страниц для обработки
+        :param pages: Список конкретных страниц для обработки (номера с 1)
+        :return: DataFrame с результатами парсинга
+        """
+        try:
+            import pdfplumber
+        except ImportError:
+            raise RuntimeError("❌ БИБЛИОТЕКА PDFPLUMBER НЕ УСТАНОВЛЕНА!")
+        
+        self._log("🚀 ЗАПУСК ОПТИМИЗИРОВАННОГО ПАРСИНГА")
+        self._log(f"📁 Файл: {os.path.basename(file_path)}")
+        
+        # Логируем параметры
+        if start_page != 1:
+            self._log(f"📄 Начальная страница: {start_page}")
+        if end_page:
+            self._log(f"📄 Конечная страница: {end_page}")
+        if max_pages:
+            self._log(f"⚡ Ограничение: не более {max_pages} страниц")
+            
+        all_tables = []
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                total_pages_in_pdf = len(pdf.pages)
+                self._log(f"📄 Найдено страниц: {total_pages_in_pdf}")
+                
+                # Корректируем диапазон страниц
+                if start_page < 1:
+                    start_page = 1
+                
+                if end_page is None:
+                    end_page = total_pages_in_pdf
+                elif end_page > total_pages_in_pdf:
+                    end_page = total_pages_in_pdf
+                
+                # Применяем ограничение max_pages
+                pages_in_range = end_page - start_page + 1
+                if max_pages and max_pages > 0 and pages_in_range > max_pages:
+                    end_page = start_page + max_pages - 1
+                
+                self._log(f"📄 Обрабатываем страницы: {start_page}-{end_page}")
+                
+                for page_num in range(start_page, end_page + 1):
+                    page = pdf.pages[page_num - 1]
+                    
+                    # 🔥 БЫСТРАЯ ПРОВЕРКА СТРАНИЦЫ (добавлено)
+                    if not self._should_process_page(page, page_num):
+                        continue
+                    
+                    self._log(f"\n📖 ОБРАБОТКА СТРАНИЦЫ {page_num}/{end_page}")
+                    strategies = [
+                        {"name": "ТЕКСТ+ТЕКСТ", "params": {"vertical_strategy": "text", "horizontal_strategy": "text", "snap_tolerance": 8}},
+                        {"name": "ЛИНИИ+ТЕКСТ", "params": {"vertical_strategy": "lines", "horizontal_strategy": "text", "snap_tolerance": 8}},
+                    ]
+                    best_table_for_page = None
+                    for strategy in strategies:
+                        strategy_name = strategy["name"]
+                        strategy_params = strategy["params"]
+                        self._log(f"🎯 Тестируем стратегию: {strategy_name}")
+                        try:
+                            tables = page.extract_tables(strategy_params)
+                            if tables:
+                                for table_idx, table in enumerate(tables):
+                                    if table and self._is_valid_table(table):
+                                        df = self._table_to_dataframe(table, page_num, strategy_name, table_idx)
+                                        if not df.empty:
+                                            df = self._fix_ocr_artifacts(df)
+                                            if best_table_for_page is None or len(df) > len(best_table_for_page):
+                                                best_table_for_page = df
+                                                self._log(f"✅ Найдена лучшая таблица: {df.shape}")
+                        except Exception as e:
+                            self._log(f"❌ Ошибка в стратегии {strategy_name}: {e}", "DEBUG")
+                            continue
+                    if best_table_for_page is not None:
+                        all_tables.append(best_table_for_page)
+                        self._log(f"📊 Добавлена таблица со страницы {page_num}: {best_table_for_page.shape}")
+                    else:
+                        self._log(f"⚠️ На странице {page_num} не найдено валидных таблиц")
+            
+            self._log(f"\n📊 ВСЕГО НАЙДЕНО ТАБЛИЦ: {len(all_tables)}")
+            if not all_tables:
+                self._log("❌ Нет таблиц для обработки")
+                return pd.DataFrame()
+            
+            result_df = pd.concat(all_tables, ignore_index=True)
+            result_df = self._final_cleanup(result_df)
+            result_df = self._replace_na_values(result_df)
+            self._analyze_final_result(result_df, file_path)
+            
+            if result_df.empty:
+                self._log("⚠️ ВНИМАНИЕ: В PDF НЕ НАЙДЕНО ТАБЛИЧНЫХ ДАННЫХ")
+            else:
+                self._log(f"✅ УСПЕХ! СОЗДАН DATAFRAME: {result_df.shape}")
+            
+            return result_df
+            
+        except Exception as e:
+            error_msg = f"❌ ОШИБКА ПАРСИНГА: {str(e)}\n{traceback.format_exc()}"
+            self._log(error_msg, "ERROR")
+            raise RuntimeError(error_msg)
+
+    def _fix_ocr_artifacts(self, df: pd.DataFrame) -> pd.DataFrame:
+        self._log("🔧 ИСПРАВЛЕНИЕ OCR-АРТЕФАКТОВ...")
+        fixed_count = 0
+        for col in df.columns:
+            if df[col].dtype == 'object':
+                for idx in df.index:
+                    original_value = str(df.at[idx, col])
+                    if original_value and any(original_value[i] == original_value[i+1] for i in range(len(original_value)-1) if original_value[i].isalpha()):
+                        fixed_value = self._fix_double_chars(original_value)
+                        if fixed_value != original_value:
+                            df.at[idx, col] = fixed_value
+                            fixed_count += 1
+        self._log(f"   🔄 Исправлено {fixed_count} значений с OCR-артефактами")
+        return df
+
+    def _fix_double_chars(self, text: str) -> str:
+        if not text or len(text) < 2:
+            return text
+        result = []
+        i = 0
+        while i < len(text):
+            if (i + 1 < len(text) and text[i] == text[i+1] and text[i].isalpha()):
+                result.append(text[i])
+                i += 2
+            else:
+                result.append(text[i])
+                i += 1
+        return ''.join(result)
+
+    def quick_test(self, file_path: str):
+        self._log("⚡ БЫСТРЫЙ ТЕСТ ПАРСИНГА")
+        import pdfplumber
+        with pdfplumber.open(file_path) as pdf:
+            page = pdf.pages[0]
+            tables = page.extract_tables({"vertical_strategy": "text", "horizontal_strategy": "text"})
+            if tables and tables[0]:
+                df = pd.DataFrame(tables[0])
+                df = df.replace(r'^\s*$', '', regex=True)
+                df = df.fillna('')
+                df = df.loc[df.astype(bool).any(axis=1)]
+                df = df.loc[:, df.astype(bool).any(axis=0)]
+                df = self._fix_ocr_artifacts(df)
+                self._log(f"⚡ Результат быстрого теста: {df.shape}")
+                self._log("📋 Первые 5 строк:")
+                for i in range(min(5, len(df))):
+                    row_preview = [str(cell)[:30] for cell in df.iloc[i].values if str(cell).strip()]
+                    self._log(f"   Строка {i}: {row_preview}")
+                return df
+        return pd.DataFrame()
+
+    # ============ НОВЫЙ МЕТОД: ДИАЛОГ ВЫБОРА СТРАНИЦ ============
+    def show_page_selection_dialog(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """
+        Показывает диалоговое окно для выбора страниц для парсинга
+        
+        :param file_path: Путь к PDF файлу
+        :return: Словарь с выбранными параметрами или None если отмена
+        """
+        try:
+            import tkinter as tk
+            from tkinter import ttk, messagebox
+        except ImportError:
+            self._log("❌ Tkinter не установлен. Используйте параметры start_page/end_page напрямую", "ERROR")
+            return None
+        
+        try:
+            import pdfplumber
+        except ImportError:
+            self._log("❌ pdfplumber не установлен", "ERROR")
+            return None
+        
+        if not os.path.exists(file_path):
+            self._log(f"❌ Файл не найден: {file_path}", "ERROR")
+            return None
+        
+        result = {
+            'start_page': 1,
+            'end_page': None,
+            'max_pages': None,
+            'use_lazy_loading': False,
+            'method': 'standard'  # 'standard', 'optimized', 'lazy'
+        }
+        
+        # Создаем основное окно
+        root = tk.Tk()
+        root.title(f"Выбор страниц для парсинга: {os.path.basename(file_path)}")
+        root.geometry("700x500")
+        
+        # Получаем информацию о PDF
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                total_pages = len(pdf.pages)
+                # Получаем превью первых 5 страниц
+                page_previews = []
+                for i in range(min(5, total_pages)):
+                    page = pdf.pages[i]
+                    text = page.extract_text()
+                    if text:
+                        preview = text[:150].replace('\n', ' ') + "..." if len(text) > 150 else text
+                    else:
+                        preview = "[Изображение/чертеж - мало текста]"
+                    page_previews.append((i+1, preview))
+        except Exception as e:
+            self._log(f"❌ Ошибка открытия PDF: {e}", "ERROR")
+            messagebox.showerror("Ошибка", f"Не удалось открыть PDF файл:\n{str(e)}")
+            root.destroy()
+            return None
+        
+        # Переменные для хранения выбора
+        start_var = tk.StringVar(value="1")
+        end_var = tk.StringVar(value=str(total_pages))
+        max_pages_var = tk.StringVar(value="")
+        use_lazy_var = tk.BooleanVar(value=False)
+        method_var = tk.StringVar(value="standard")
+        
+        # Функция для обновления диапазона
+        def update_range():
+            try:
+                start = int(start_var.get())
+                end = int(end_var.get())
+                max_pages = max_pages_var.get()
+                
+                if start < 1:
+                    start_var.set("1")
+                if start > total_pages:
+                    start_var.set(str(total_pages))
+                
+                if end < 1:
+                    end_var.set("1")
+                if end > total_pages:
+                    end_var.set(str(total_pages))
+                
+                if max_pages:
+                    max_val = int(max_pages)
+                    if max_val < 1:
+                        max_pages_var.set("1")
+            except:
+                pass
+        
+        # Функция для выбора всех страниц
+        def select_all_pages():
+            start_var.set("1")
+            end_var.set(str(total_pages))
+            max_pages_var.set("")
+        
+        # Функция для быстрого выбора первых N страниц
+        def select_first_n():
+            n = min(20, total_pages)
+            start_var.set("1")
+            end_var.set(str(n))
+            max_pages_var.set(str(n))
+        
+        # Функция для применения выбора
+        def apply_selection():
+            try:
+                result['start_page'] = int(start_var.get())
+                result['end_page'] = int(end_var.get())
+                
+                if max_pages_var.get():
+                    result['max_pages'] = int(max_pages_var.get())
+                else:
+                    result['max_pages'] = None
+                
+                result['use_lazy_loading'] = use_lazy_var.get()
+                result['method'] = method_var.get()
+                
+                # Проверка валидности
+                if result['start_page'] > result['end_page']:
+                    messagebox.showerror("Ошибка", "Начальная страница не может быть больше конечной")
+                    return
+                
+                if result['start_page'] < 1 or result['end_page'] > total_pages:
+                    messagebox.showerror("Ошибка", f"Диапазон страниц должен быть от 1 до {total_pages}")
+                    return
+                
+                root.destroy()
+                
+            except ValueError:
+                messagebox.showerror("Ошибка", "Пожалуйста, введите корректные числа")
+        
+        # Функция для отмены
+        def cancel_selection():
+            nonlocal result
+            result = None
+            root.destroy()
+        
+        # Создаем интерфейс
+        main_frame = ttk.Frame(root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Информация о файле
+        info_frame = ttk.LabelFrame(main_frame, text="Информация о PDF", padding="10")
+        info_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        ttk.Label(info_frame, text=f"Файл: {os.path.basename(file_path)}", font=('Arial', 10, 'bold')).grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(info_frame, text=f"Всего страниц: {total_pages}", font=('Arial', 10)).grid(row=1, column=0, sticky=tk.W)
+        
+        # Превью страниц
+        if page_previews:
+            preview_frame = ttk.LabelFrame(main_frame, text="Превью первых страниц", padding="10")
+            preview_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+            
+            for i, (page_num, preview) in enumerate(page_previews):
+                ttk.Label(preview_frame, text=f"Страница {page_num}:", font=('Arial', 9, 'bold')).grid(row=i, column=0, sticky=tk.W, pady=(5,0))
+                preview_text = tk.Text(preview_frame, height=2, width=60, wrap=tk.WORD)
+                preview_text.grid(row=i, column=1, sticky=tk.W, pady=(5,0))
+                preview_text.insert('1.0', preview)
+                preview_text.config(state=tk.DISABLED)
+        
+        # Выбор диапазона страниц
+        range_frame = ttk.LabelFrame(main_frame, text="Выбор страниц для парсинга", padding="10")
+        range_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        ttk.Label(range_frame, text="Начальная страница:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        start_spinbox = ttk.Spinbox(range_frame, from_=1, to=total_pages, textvariable=start_var, width=10)
+        start_spinbox.grid(row=0, column=1, sticky=tk.W, pady=5, padx=(5, 20))
+        
+        ttk.Label(range_frame, text="Конечная страница:").grid(row=0, column=2, sticky=tk.W, pady=5)
+        end_spinbox = ttk.Spinbox(range_frame, from_=1, to=total_pages, textvariable=end_var, width=10)
+        end_spinbox.grid(row=0, column=3, sticky=tk.W, pady=5)
+        
+        ttk.Label(range_frame, text="Макс. страниц (опционально):").grid(row=1, column=0, sticky=tk.W, pady=5)
+        max_entry = ttk.Entry(range_frame, textvariable=max_pages_var, width=10)
+        max_entry.grid(row=1, column=1, sticky=tk.W, pady=5, padx=(5, 20))
+        
+        # Быстрые кнопки выбора
+        button_frame = ttk.Frame(range_frame)
+        button_frame.grid(row=2, column=0, columnspan=4, pady=10)
+        
+        ttk.Button(button_frame, text="Все страницы", command=select_all_pages, width=15).pack(side=tk.LEFT, padx=2)
+        ttk.Button(button_frame, text="Первые 20 страниц", command=select_first_n, width=15).pack(side=tk.LEFT, padx=2)
+        
+        # Настройки парсинга
+        settings_frame = ttk.LabelFrame(main_frame, text="Настройки парсинга", padding="10")
+        settings_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        ttk.Label(settings_frame, text="Метод парсинга:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        method_combo = ttk.Combobox(settings_frame, textvariable=method_var, 
+                                   values=["standard", "optimized", "lazy"], 
+                                   state="readonly", width=15)
+        method_combo.grid(row=0, column=1, sticky=tk.W, pady=5, padx=(5, 20))
+        
+        lazy_check = ttk.Checkbutton(settings_frame, text="Использовать ленивую загрузку (экономит память)", 
+                                    variable=use_lazy_var)
+        lazy_check.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=5)
+        
+        # Кнопки действий
+        action_frame = ttk.Frame(main_frame)
+        action_frame.grid(row=4, column=0, columnspan=2, pady=20)
+        
+        ttk.Button(action_frame, text="Начать парсинг", command=apply_selection, 
+                  style="Accent.TButton").pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="Отмена", command=cancel_selection).pack(side=tk.LEFT, padx=5)
+        
+        # Стиль для акцентной кнопки
+        style = ttk.Style()
+        style.configure("Accent.TButton", foreground="white", background="#0078D7")
+        
+        # Привязываем события
+        start_spinbox.bind('<FocusOut>', lambda e: update_range())
+        end_spinbox.bind('<FocusOut>', lambda e: update_range())
+        max_entry.bind('<FocusOut>', lambda e: update_range())
+        
+        # Запускаем главный цикл
+        root.mainloop()
+        
+        return result
+    
+    # ============ НОВЫЙ МЕТОД: ПАРСИНГ С ДИАЛОГОМ ВЫБОРА ============
+    def parse_with_dialog(self, file_path: str) -> pd.DataFrame:
+        """
+        Основной метод для вызова из GUI - показывает диалог выбора страниц
+        
+        :param file_path: Путь к PDF файлу
+        :return: DataFrame с результатами парсинга
+        """
+        self._log(f"\n{'='*80}")
+        self._log(f"🔄 ЗАПУСК ПАРСИНГА С ДИАЛОГОМ ВЫБОРА СТРАНИЦ")
+        self._log(f"📁 Файл: {file_path}")
+        self._log(f"{'='*80}")
+        
+        # Показываем диалог выбора страниц
+        selection = self.show_page_selection_dialog(file_path)
+        
+        if selection is None:
+            self._log("❌ Парсинг отменен пользователем")
+            return pd.DataFrame()
+        
+        self._log(f"📋 ВЫБРАННЫЕ ПАРАМЕТРЫ:")
+        self._log(f"   Начальная страница: {selection['start_page']}")
+        self._log(f"   Конечная страница: {selection['end_page']}")
+        self._log(f"   Макс. страниц: {selection['max_pages']}")
+        self._log(f"   Метод: {selection['method']}")
+        self._log(f"   Ленивая загрузка: {selection['use_lazy_loading']}")
+        
+        # Выбираем метод парсинга в зависимости от выбора
+        if selection['method'] == 'lazy' or selection['use_lazy_loading']:
+            self._log("⚡ Используем метод с ленивой загрузкой")
+            return self.parse_with_lazy_loading(
+                file_path,
+                start_page=selection['start_page'],
+                end_page=selection['end_page'],
+                max_pages=selection['max_pages']
+            )
+        elif selection['method'] == 'optimized':
+            self._log("⚡ Используем оптимизированный метод")
+            return self.parse_optimized(
+                file_path,
+                start_page=selection['start_page'],
+                end_page=selection['end_page'],
+                max_pages=selection['max_pages']
+            )
+        else:
+            self._log("⚡ Используем стандартный метод")
+            return self.parse_to_dataframe_with_range(
+                file_path,
+                start_page=selection['start_page'],
+                end_page=selection['end_page'],
+                max_pages=selection['max_pages']
+            )
+
+    # ============ НОВЫЙ МЕТОД: УМНЫЙ ПАРСИНГ С АВТОВЫБОРОМ ============
+    def smart_parse(self, file_path: str, show_dialog: bool = True) -> pd.DataFrame:
+        """
+        Умный парсинг: показывает диалог выбора или использует настройки по умолчанию
+        
+        :param file_path: Путь к PDF файлу
+        :param show_dialog: Показывать ли диалог выбора страниц
+        :return: DataFrame с результатами парсинга
+        """
+        if show_dialog:
+            return self.parse_with_dialog(file_path)
+        else:
+            # Используем настройки по умолчанию
+            self._log("⚡ Используем парсинг по умолчанию (первые 50 страниц)")
+            return self.parse_to_dataframe(file_path, max_pages=50)
+    
+    # ============ НОВЫЙ МЕТОД: БЫСТРЫЙ ПАРСИНГ ТОЛЬКО С ТАБЛИЦАМИ ============
+    def quick_parse_only_tables(self, file_path: str) -> pd.DataFrame:
+        """
+        Быстрый парсинг только страниц с таблицами (автоматический выбор)
+        
+        :param file_path: Путь к PDF файлу
+        :return: DataFrame с результатами парсинга
+        """
+        self._log("⚡ ЗАПУСК БЫСТРОГО ПАРСИНГА ТОЛЬКО СТРАНИЦ С ТАБЛИЦАМИ")
+        
+        try:
+            import pdfplumber
+        except ImportError:
+            raise RuntimeError("❌ БИБЛИОТЕКА PDFPLUMBER НЕ УСТАНОВЛЕНА!")
+        
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"❌ ФАЙЛ НЕ НАЙДЕН: {file_path}")
+        
+        all_tables = []
+        pages_with_tables = []
+        
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                total_pages = len(pdf.pages)
+                self._log(f"📄 Всего страниц: {total_pages}")
+                self._log("🔍 Автоматически ищу страницы с таблицами...")
+                
+                # Сначала находим все страницы с таблицами
+                for page_num in range(1, total_pages + 1):
+                    page = pdf.pages[page_num - 1]
+                    
+                    if self._should_process_page(page, page_num):
+                        pages_with_tables.append(page_num)
+                
+                self._log(f"✅ Найдено страниц с таблицами: {len(pages_with_tables)}")
+                
+                if not pages_with_tables:
+                    self._log("❌ Не найдено страниц с таблицами радиаторов")
+                    return pd.DataFrame()
+                
+                # Обрабатываем только страницы с таблицами
+                for i, page_num in enumerate(pages_with_tables):
+                    page = pdf.pages[page_num - 1]
+                    
+                    if self.progress_callback:
+                        self.progress_callback(i + 1, len(pages_with_tables))
+                    
+                    self._log(f"📖 Обрабатываю страницу с таблицей {i+1}/{len(pages_with_tables)}: стр. {page_num}")
+                    
+                    page_tables = self._extract_tables_universal(page, page_num)
+                    if page_tables:
+                        all_tables.extend(page_tables)
+                
+                self._log(f"📊 Найдено таблиц: {len(all_tables)}")
+                
+                if all_tables:
+                    result_df = self._merge_all_tables(all_tables)
+                    result_df = self._replace_na_values(result_df)
+                    self._analyze_final_result(result_df, file_path)
+                    return result_df
+                else:
+                    return pd.DataFrame()
+                    
+        except Exception as e:
+            error_msg = f"❌ ОШИБКА БЫСТРОГО ПАРСИНГА: {str(e)}\n{traceback.format_exc()}"
+            self._log(error_msg, "ERROR")
+            raise RuntimeError(error_msg)
+
+    # ============ НОВЫЙ КЛАСС ДЛЯ ЛЕНИВОЙ ЗАГРУЗКИ ============
+    class LazyPDFReader:
+        """Ленивый загрузчик PDF - загружает страницы только при обращении"""
+        def __init__(self, file_path: str):
+            self.file_path = file_path
+            self._pdf = None
+            self._total_pages = None
+        
+        def __enter__(self):
+            return self
+        
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if self._pdf:
+                self._pdf.close()
+        
+        @property
+        def total_pages(self) -> int:
+            if self._total_pages is None:
+                import pdfplumber
+                with pdfplumber.open(self.file_path) as temp_pdf:
+                    self._total_pages = len(temp_pdf.pages)
+            return self._total_pages
+        
+        def get_page(self, page_num: int):
+            """Получить страницу по номеру (начиная с 1)"""
+            if page_num < 1 or page_num > self.total_pages:
+                raise IndexError(f"Страница {page_num} вне диапазона 1-{self.total_pages}")
+            
+            if self._pdf is None:
+                import pdfplumber
+                self._pdf = pdfplumber.open(self.file_path)
+            
+            return self._pdf.pages[page_num - 1]
+        
+        def close(self):
+            """Закрыть PDF файл"""
+            if self._pdf:
+                self._pdf.close()
+                self._pdf = None
+
+    # ============ НОВЫЙ МЕТОД: ПАРСИНГ С ЛЕНИВОЙ ЗАГРУЗКОЙ ============
+    def parse_with_lazy_loading(self, file_path: str, 
+                                start_page: int = 1, 
+                                end_page: Optional[int] = None,
+                                max_pages: Optional[int] = None) -> pd.DataFrame:
+        """
+        Парсинг с ленивой загрузкой страниц - экономит память
+        
+        :param file_path: Путь к PDF файлу
+        :param start_page: Номер первой страницы (начиная с 1)
+        :param end_page: Номер последней страницы (None = до конца)
+        :param max_pages: Максимальное количество страниц
+        :return: DataFrame с результатами парсинга
+        """
+        try:
+            import pdfplumber
+        except ImportError:
+            raise RuntimeError("❌ БИБЛИОТЕКА PDFPLUMBER НЕ УСТАНОВЛЕНА! Выполните: pip install pdfplumber")
+        
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"❌ ФАЙЛ НЕ НАЙДЕН: {file_path}")
+        
+        self._log("🚀" * 50)
+        self._log(f"🚀 ЗАПУСК ПАРСИНГА С ЛЕНИВОЙ ЗАГРУЗКОЙ: {os.path.basename(file_path)}")
+        self._log(f"📁 Полный путь: {file_path}")
+        
+        try:
+            all_tables = []
+            total_pages_processed = 0
+            total_pages_skipped = 0
+            
+            with self.LazyPDFReader(file_path) as lazy_pdf:
+                total_pages = lazy_pdf.total_pages
+                self._log(f"📄 ОБНАРУЖЕНО СТРАНИЦ В PDF: {total_pages}")
+                
+                # Корректируем диапазон страниц
+                if start_page < 1:
+                    start_page = 1
+                
+                if end_page is None:
+                    end_page = total_pages
+                elif end_page > total_pages:
+                    end_page = total_pages
+                
+                # Применяем ограничение max_pages
+                pages_in_range = end_page - start_page + 1
+                if max_pages and max_pages > 0 and pages_in_range > max_pages:
+                    end_page = start_page + max_pages - 1
+                
+                self._log(f"📄 ДИАПАЗОН ОБРАБОТКИ: страницы {start_page}-{end_page}")
+                
+                for page_num in range(start_page, end_page + 1):
+                    # 🔥 ВЫЗЫВАЕМ ОБРАТНЫЙ ВЫЗОВ ПРОГРЕССА (если задан)
+                    if self.progress_callback:
+                        self.progress_callback(page_num - start_page + 1, end_page - start_page + 1)
+                    
+                    # 🔥 ЛЕНИВАЯ ЗАГРУЗКА: страница загружается только здесь
+                    page = lazy_pdf.get_page(page_num)
+                    
+                    # 🔥 БЫСТРАЯ ПРОВЕРКА: СТОИТ ЛИ ОБРАБАТЫВАТЬ ЭТУ СТРАНИЦУ?
+                    if not self._should_process_page(page, page_num):
+                        total_pages_skipped += 1
+                        # Освобождаем память
+                        del page
+                        continue
+                    
+                    self._log(f"\n📖 {'='*60}")
+                    self._log(f"📖 ОБРАБОТКА СТРАНИЦЫ {page_num}/{end_page} (ленивая загрузка)")
+                    self._log(f"📖 {'='*60}")
+                    
+                    page_tables = self._extract_tables_universal(page, page_num)
+                    if page_tables:
+                        all_tables.extend(page_tables)
+                        total_pages_processed += 1
+                    
+                    # Анализ текста только если есть таблицы
+                    if page_tables:
+                        self._extract_and_analyze_text(page, page_num)
+                    
+                    # Освобождаем память после обработки страницы
+                    del page
+                    import gc
+                    gc.collect()
+            
+            # Сводка по обработке
+            self._log(f"\n📊 {'='*60}")
+            self._log(f"📊 СВОДКА ПО ПАРСИНГУ (ленивая загрузка):")
+            self._log(f"📊 Всего страниц в PDF: {total_pages}")
+            self._log(f"📊 Диапазон обработки: {start_page}-{end_page}")
+            self._log(f"📊 Обработано страниц: {total_pages_processed}")
+            self._log(f"📊 Пропущено страниц: {total_pages_skipped}")
+            self._log(f"📊 Найдено таблиц: {len(all_tables)}")
+            self._log(f"📊 {'='*60}")
+            
+            if all_tables:
+                # Выбираем только лучшие таблицы (без дублирования страниц)
+                best_tables = []
+                pages_processed = set()
+                for table in all_tables:
+                    page = table['_source_page'].iloc[0] if '_source_page' in table.columns else 0
+                    if page not in pages_processed:
+                        best_tables.append(table)
+                        pages_processed.add(page)
+                
+                self._log(f"📊 Выбрано {len(best_tables)} лучших таблиц из {len(all_tables)}")
+                result_df = self._merge_all_tables(best_tables)
+            else:
+                result_df = pd.DataFrame()
+            
+            result_df = self._replace_na_values(result_df)
+            self._analyze_final_result(result_df, file_path)
+            
+            if not result_df.empty:
+                self._log(f"✅ УСПЕХ! СОЗДАН DATAFRAME: {result_df.shape}")
+                # Извлекаем радиаторы из результата
+                radiators = self.extract_radiators_from_dataframe(result_df)
+                self._log(f"✅ Извлечено {len(radiators)} позиций радиаторов")
+            else:
+                self._log("⚠️ ВНИМАНИЕ: В PDF НЕ НАЙДЕНО ТАБЛИЧНЫХ ДАННЫХ")
+            
+            return result_df
+            
+        except Exception as e:
+            error_msg = f"❌ ОШИБКА ПАРСИНГА С ЛЕНИВОЙ ЗАГРУЗКОЙ {file_path}:\n{str(e)}\n{traceback.format_exc()}"
+            self._log(error_msg, "ERROR")
+            raise RuntimeError(error_msg)
+
+# ============ ТЕСТОВЫЙ БЛОК ============
+if __name__ == "__main__":
+    # Тестирование нового функционала
+    parser = PDFParser()
+    
+    # Тестовый PDF файл
+    test_pdf = "03_2023-72.206, 72.208-ОВ_секция 1.pdf"
+    
+    if os.path.exists(test_pdf):
+        print("\n🧪 ТЕСТИРУЕМ НОВЫЙ ФУНКЦИОНАЛ С ДИАЛОГОВЫМИ ОКНАМИ...")
+        
+        print("\n1. 📄 Тестируем умный парсинг (с диалогом):")
+        print("   💡 Откроется окно выбора страниц...")
+        try:
+            # Для теста отключаем диалог, чтобы не зависать
+            df1 = parser.smart_parse(test_pdf, show_dialog=False)
+            print(f"   Результат (без диалога): {df1.shape if not df1.empty else 'пусто'}")
+        except Exception as e:
+            print(f"   Ошибка: {e}")
+        
+        print("\n2. 📄 Тестируем быстрый парсинг только страниц с таблицами:")
+        try:
+            df2 = parser.quick_parse_only_tables(test_pdf)
+            print(f"   Результат: {df2.shape if not df2.empty else 'пусто'}")
+        except Exception as e:
+            print(f"   Ошибка: {e}")
+        
+        print("\n3. 📄 Тестируем стандартный парсинг с явным указанием страниц:")
+        try:
+            df3 = parser.parse_to_dataframe(test_pdf, start_page=1, end_page=5, max_pages=3)
+            print(f"   Результат: {df3.shape if not df3.empty else 'пусто'}")
+        except Exception as e:
+            print(f"   Ошибка: {e}")
+        
+        print("\n4. 📄 Тестируем парсинг с диалогом (закомментировано для автотестов):")
+        print("   # Раскомментируйте для реального теста:")
+        print("   # df4 = parser.parse_with_dialog(test_pdf)")
+        print("   # df4 = parser.smart_parse(test_pdf, show_dialog=True)")
+        
+        print("\n📊 РЕКОМЕНДАЦИИ ПО ИСПОЛЬЗОВАНИЮ:")
+        print("   1. Для GUI приложения используйте: parser.parse_with_dialog(file_path)")
+        print("   2. Для автоматической обработки: parser.quick_parse_only_tables(file_path)")
+        print("   3. Для пакетной обработки: parser.parse_to_dataframe(file_path, start_page=X, end_page=Y)")
+        print("   4. Для экономии памяти: parser.parse_with_lazy_loading(file_path)")
+        
+    else:
+        print(f"❌ Тестовый файл не найден: {test_pdf}")
+        print("\n💡 ПРИМЕРЫ ИСПОЛЬЗОВАНИЯ НОВОГО ФУНКЦИОНАЛА:")
+        print("\nС диалоговым окном:")
+        print("   df = parser.parse_with_dialog('file.pdf')")
+        print("   df = parser.smart_parse('file.pdf', show_dialog=True)")
+        
+        print("\nБез диалога (программно):")
+        print("   df = parser.parse_to_dataframe('file.pdf', start_page=5, end_page=15)")
+        print("   df = parser.parse_to_dataframe('file.pdf', max_pages=50)")
+        print("   df = parser.quick_parse_only_tables('file.pdf')")
+        print("   df = parser.parse_with_lazy_loading('file.pdf', start_page=1, end_page=100)")

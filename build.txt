@@ -1,0 +1,168 @@
+# -*- mode: python ; coding: utf-8 -*-
+
+from PyInstaller.utils.hooks import collect_data_files
+import os
+
+block_cipher = None
+
+# Список файлов данных
+data_files = [
+    ('Матрица.xlsx', '.'), 
+    ('Прайс-лист.xlsx', '.'), 
+    ('Расчет мощностей METEOR.xlsx', '.'), 
+    ('Формуляр для регистрации проектов.xlsm', '.'), 
+    ('icon.ico', '.'),
+    ('Lagar.png', '.'),
+    ('inst.pdf', '.'),
+    # Изображения для подсказок
+    ('1.png', '.'),
+    ('2.png', '.'),
+    ('3.png', '.'),
+    # Файлы данных
+    ('patterns.json', '.'),
+]
+
+# Добавляем дополнительные файлы из папки, если они существуют
+additional_files = [
+    'correspondence_manager.py',
+    'column_selector.py', 
+    'meteor_selector.py',
+    'pattern_manager.py',
+    'pdf_page_selector.py',
+    'parsers.py',
+    'debug_tools.py',
+    'pdf_parser.py',
+    'spec_generator.py',
+    'interface_builder.py',  
+    # Добавьте другие модули если есть
+]
+
+for file in additional_files:
+    if os.path.exists(file):
+        data_files.append((file, '.'))
+
+# Добавляем данные PyMuPDF и Pillow
+try:
+    # Данные Pillow (для работы с изображениями)
+    pillow_datas = collect_data_files('PIL')
+    for dest, src in pillow_datas:
+        data_files.append((dest, src))
+except:
+    print("Предупреждение: Не удалось собрать данные Pillow")
+
+# Добавляем данные PyMuPDF (fitz) вручную
+try:
+    import fitz
+    # Получаем путь к установленному PyMuPDF
+    import pymupdf
+    fitz_path = os.path.dirname(pymupdf.__file__)
+    # Добавляем все файлы из папки fitz
+    for root, dirs, files in os.walk(fitz_path):
+        for file in files:
+            if file.endswith(('.py', '.so', '.dll', '.pyd', '.dat')):
+                src_path = os.path.join(root, file)
+                rel_path = os.path.relpath(src_path, os.path.dirname(fitz_path))
+                data_files.append((src_path, os.path.dirname(rel_path)))
+    print(f"Добавлены данные PyMuPDF из: {fitz_path}")
+except ImportError:
+    print("Предупреждение: PyMuPDF не установлен")
+
+a = Analysis(
+    ['start_v10.2013.py'],  # ← ОБНОВЛЕНО имя файла на актуальное
+    pathex=[os.getcwd()],  
+    binaries=[],
+    datas=data_files,
+    hiddenimports=[
+        'pandas', 
+        'openpyxl', 
+        'tkinter',
+        'tkinter.ttk',
+        'pyperclip',
+        'json',
+        'numpy',
+        'xlrd',
+        'chardet',      # Добавлено для определения кодировки
+        're',           # Добавлено для регулярных выражений
+        'datetime',     # Добавлено для работы с датами
+        'tempfile',     # Добавлено для временных файлов
+        'platform',     # Добавлено для определения ОС
+        'subprocess',   # Добавлено для запуска процессов
+        'webbrowser',   # Добавлено для открытия браузера
+        'traceback',    # Добавлено для обработки ошибок
+        'typing',       # Добавлено для аннотаций типов
+        'collections',  # Добавлено для структур данных
+        'string',       # Добавлено для работы со строками
+        'sys',          # Добавлено для системных функций
+        'os',           # Добавлено для работы с файловой системой
+        'queue',        # Добавлено для многопоточности в pdf_page_selector.py
+        'threading',    # Добавлено для многопоточности
+        'io',           # Добавлено для BytesIO
+        'PIL',          # Pillow для работы с изображениями
+        'PIL.Image',    # Модули Pillow
+        'PIL.ImageTk',
+        'PIL._imaging',
+        'PIL._imagingtk',
+        'fitz',         # PyMuPDF
+        'pymupdf',      # Альтернативное имя PyMuPDF
+        'frontend',     # Модуль PyMuPDF
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    # Исключаем только действительно ненужные библиотеки
+    excludes=[
+        'matplotlib', 
+        'scipy', 
+        'pytest',
+        'PyQt5',
+        'PySide2',
+        'wx',
+        'test',
+        'unittest',
+    ],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+# Дополнительно собираем все скрытые импорты для Tkinter и других библиотек
+for mod in ['tkinter', 'PIL', 'fitz', 'pymupdf']:
+    try:
+        import importlib
+        imported = importlib.import_module(mod)
+        # Добавляем основные подмодули
+        for attr in dir(imported):
+            try:
+                submodule_name = f"{mod}.{attr}"
+                importlib.import_module(submodule_name)
+                if submodule_name not in a.hiddenimports:
+                    a.hiddenimports.append(submodule_name)
+            except:
+                pass
+    except ImportError:
+        pass
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    [],
+    name='NexTT-1',  
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=os.path.join('icon.ico'),
+)
